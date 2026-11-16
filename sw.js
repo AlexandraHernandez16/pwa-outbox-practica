@@ -1,64 +1,115 @@
-// Importar el mini-wrapper de IndexedDB en el contexto del Service Worker
+// El SW no tiene <script>: importScripts carga db-helper.js de forma síncrona
+// y deja disponibles abrirDB, guardarRegistro, obtenerTodosLosRegistros, eliminarRegistro, actualizarEstadoRegistro.
 importScripts('./db-helper.js');
 
-const CACHE_STATIC_NAME = 'static-outbox-v2';
-const STATIC_FILES = [
-  './',
-  './index.html',
-  './styles.css',
-  './db-helper.js',
-  './app.js',
-  './manifest.json',
-  './icons/icon-192.png',
-  './icons/icon-512.png'
-];
+// v2: cambió el contenido de los archivos estáticos, así que se versiona
+// el caché para que 'activate' borre el viejo 'app-static'.
+const CACHE_STATIC = 'app-static-v2';
+const CACHE_DYNAMIC = 'app-dynamic';
 
 const ENDPOINT_API = 'https://jsonplaceholder.typicode.com/posts';
 
-// ==========================================================
-// Instalación: precachear el App Shell
-// ==========================================================
-self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_STATIC_NAME)
-      .then((cache) => cache.addAll(STATIC_FILES))
-      .then(() => self.skipWaiting())
-  );
-});
+self.addEventListener(
+  'install',
+  (event) => {
+    console.log('SW instalado :D');
+    event.waitUntil(
+      caches.open(CACHE_STATIC)
+        .then((cache) => {
+          // Rutas relativas ('./') para no romper el despliegue en el
+          // subdirectorio de GitHub Pages (https://usuario.github.io/pwa-outbox-practica/)
+          return cache.addAll(
+            [
+              './',
+              './index.html',
+              './styles.css',
+              './app.js',
+              './db-helper.js',
+              './manifest.json',
+              './icons/icon-192.png',
+              './icons/icon-512.png',
+            ]
+          );
+        })
+        .then(() => self.skipWaiting())
+    );
+  }
+);
 
-// ==========================================================
-// Activación: purgar cachés de versiones anteriores
-// ==========================================================
-self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys()
-      .then((nombresCache) => {
-        return Promise.all(
-          nombresCache
-            .filter((nombre) => nombre !== CACHE_STATIC_NAME)
-            .map((nombre) => caches.delete(nombre))
-        );
-      })
-      .then(() => self.clients.claim())
-  );
-});
+self.addEventListener(
+  'activate',
+  (event) => {
+    console.log('SW Activado');
+    event.waitUntil(
+      caches.keys().then(
+        (keys) => {
+          return Promise.all(
+            keys.map((key) => {
+              if (key != CACHE_STATIC && key != CACHE_DYNAMIC) {
+                return caches.delete(key);
+              }
+            })
+          );
+        }
+      ).then(() => self.clients.claim())
+    );
+  }
+);
 
-// ==========================================================
-// Fetch: estrategia Cache First para el App Shell (solo peticiones GET)
-// ==========================================================
 self.addEventListener('fetch', (event) => {
+  // La Cache API solo admite GET. Los POST pasan directo a la red;
+  // si fallan, app.js los guarda en IndexedDB.
   if (event.request.method !== 'GET') {
     return;
   }
-
-  event.respondWith(
-    caches.match(event.request)
-      .then((respuestaCache) => {
-        return respuestaCache || fetch(event.request);
-      })
-      .catch(() => caches.match('./index.html'))
-  );
+  console.log('El SW ha interceptado la peticion ', event.request.url);
+  const apiRequest = event.request.url.includes('jsonplaceholder.typicode.com');
+  if (apiRequest) {
+    event.respondWith(networkFirst(event.request));
+  } else {
+    event.respondWith(cacheFirst(event.request));
+  }
 });
+
+function cacheFirst(request) {
+  return caches.match(request)
+    .then((respCache) => {
+      if (respCache) {
+        return respCache;
+      }
+      return fetch(request)
+        .then((respNetwork) => {
+          return caches.open(CACHE_STATIC)
+            .then((cacheStatic) => {
+              cacheStatic.put(request, respNetwork.clone());
+              return respNetwork;
+            });
+        });
+    });
+}
+
+function networkFirst(request) {
+  return fetch(request)
+    .then((respNetwork) => {
+      return caches.open(CACHE_DYNAMIC)
+        .then((cacheDynamic) => {
+          cacheDynamic.put(request, respNetwork.clone());
+          return respNetwork;
+        });
+    })
+    .catch(() => {
+      return caches.match(request)
+        .then((respCache) => {
+          if (respCache) {
+            return respCache;
+          }
+          return new Response(
+            JSON.stringify({ error: 'No hay red ni caché' }),
+            { headers: { 'Content-Type': 'application/json' } }
+          );
+        });
+    });
+}
 
 // ==========================================================
 // Notificación del Worker hacia las pestañas abiertas (postMessage)
